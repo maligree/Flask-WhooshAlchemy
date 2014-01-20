@@ -22,7 +22,8 @@ import sqlalchemy
 from whoosh.qparser import OrGroup
 from whoosh.qparser import AndGroup
 from whoosh.qparser import MultifieldParser
-from whoosh.analysis import StemmingAnalyzer
+from whoosh.analysis import StemmingAnalyzer, CharsetFilter
+from whoosh.support.charset import accent_map
 import whoosh.index
 from whoosh.fields import Schema
 #from whoosh.fields import ID, TEXT, KEYWORD, STORED
@@ -150,8 +151,8 @@ class _Searcher(object):
 
         group = OrGroup if or_ else AndGroup
         parser = MultifieldParser(fields, self._index.schema, group=group)
-        return self._index.searcher().search(parser.parse(query),
-                limit=limit)
+        query = parser.parse(query)
+        return self._index.searcher().search(query, limit=limit)
 
 
 def whoosh_index(app, model):
@@ -203,7 +204,6 @@ def _create_index(app, model):
 
     return indx
 
-
 def _get_whoosh_schema_and_primary_key(model):
     schema = {}
     primary = None
@@ -218,7 +218,26 @@ def _get_whoosh_schema_and_primary_key(model):
                     sqlalchemy.types.Unicode)):
 
             schema[field.name] = whoosh.fields.TEXT(
+                    analyzer=StemmingAnalyzer() | CharsetFilter(accent_map))
+
+    # Index fields of related models as well, those entries in 
+    # the __searchables__ attribute will contain a period.
+
+    # We need inspect to pull all relationship fields from a model
+    from sqlalchemy.inspection import inspect 
+
+    # Pull names containing periods from __searchables__
+    related_searchable = [e for e in searchable if '.' in e]
+     
+    # Get all fields that represent a relationship
+    related_fields = [e.key for e in inspect(model).relationships]
+
+    # Create a field in the schema for the specified related fields
+    for field in related_searchable:
+        if field.split('.')[0] in related_fields:
+            schema[field] = whoosh.fields.TEXT(
                     analyzer=StemmingAnalyzer())
+            
 
     return Schema(**schema), primary
 
@@ -248,11 +267,21 @@ def _after_flush(app, changes):
                 if update:
                     attrs = {}
                     for key in searchable:
-                        try:
-                            attrs[key] = unicode(getattr(v, key))
-                        except AttributeError:
-                            raise AttributeError('{0} does not have {1} field {2}'
-                                    .format(model, __searchable__, key))
+                        # Dive into related models before going down the
+                        # well-worn, original path. Adventure awaits! 
+                        if '.' in key:
+                            parts = key.split('.')
+                            # Let's assume only one-level relationships,
+                            # i.e. names contain only one period.                           
+                            related_model, field_name = parts
+                            attrs[key] = unicode(getattr(getattr(v, related_model), field_name)) 
+
+                        else:
+                            try:
+                                attrs[key] = unicode(getattr(v, key))
+                            except AttributeError:
+                                raise AttributeError('{0} does not have {1} field {2}'
+                                        .format(model, __searchable__, key))
 
                     attrs[primary_field] = unicode(getattr(v, primary_field))
                     writer.update_document(**attrs)
